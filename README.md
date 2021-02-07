@@ -3,9 +3,13 @@
 A long time ago our python cronjobs required to ensure only one script/job is running.
 Solutions at the time like tendo.singleton had minor bugs which made it incompatible with OSs we use.
 We reworked the singleton solution to make sure it works in any environment in our company.
+
 This module supports atomic file locks on FreeBSD.
+
 Windows/Linux has no support for atomic file locks however we used the fcntl locks in this case.
-Of course you have a minimal possibility of duplicate run within ~0.000017 of a second.
+
+Of course you have a minimal possibility of duplicate run within ~0.000017 of a second
+.
 In the future we might switch to semaphores and mutexes. However they have their own drawbacks for example when you have zombie processes.
 
 This module provides an OnlyOne() class which atomically creates a lock file containing PID of the running process to prevent parallel execution of the same program.
