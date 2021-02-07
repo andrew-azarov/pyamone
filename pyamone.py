@@ -1,6 +1,6 @@
 #! /usr/bin/env python
 """
-Copyright (c) 2017 Andrew Azarov
+Copyright (c) 2017,2021 Andrew Azarov
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
@@ -44,71 +44,22 @@ except ImportError:
 BSD = hasattr(os, 'O_EXLOCK')
 
 
-def pid_exists(pid):
-    """Check whether pid exists in the current process table."""
-    # http://stackoverflow.com/a/23409343/2010538
-    # http://stackoverflow.com/a/28065945/2010538
-    if os.name != 'nt':
-        import errno
-        if pid <= 0:
-            return False
-        try:
-            os.kill(pid, 0)
-        except OSError as e:
-            return e.errno == errno.EPERM
-        else:
-            return True
-    else:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        HANDLE = ctypes.c_void_p
-        DWORD = ctypes.c_ulong
-        LPDWORD = ctypes.POINTER(DWORD)
-
-        class ExitCodeProcess(ctypes.Structure):
-            _fields_ = [('hProcess', HANDLE),
-                        ('lpExitCode', LPDWORD)]
-
-        PROCESS_QUERY_INFORMATION = 0x1000
-        process = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid)
-        if not process:
-            return False
-
-        ec = ExitCodeProcess()
-        out = kernel32.GetExitCodeProcess(process, ctypes.byref(ec))
-        if not out:
-            err = kernel32.GetLastError()
-            if err == 5:  # Look after this change, maybe previous line was just a skip
-                # Access is denied.
-                logger.warning("Access is denied to get pid info.")
-            kernel32.CloseHandle(process)
-            return False
-        elif bool(ec.lpExitCode):
-            # print ec.lpExitCode.contents
-            # There is an exit code, it quit
-            kernel32.CloseHandle(process)
-            return False
-        # No exit code, it's running.
-        kernel32.CloseHandle(process)
-        return True
-
-
-class SingletException(BaseException):
+class OnlyOneException(BaseException):
     pass
 
 
-class Singlet:
+class OnlyOne:
 
     """
     Based on tendo.singleton
-    This module provides a Singlet() class which atomically creates a lock file
+    This module provides a OnlyOne() class which atomically creates a lock file
     containing PID of the running process to prevent parallel execution of the
     same program. In case there is any other instance running already a
-    `SingletException` will be thrown. The class will throw `IOError` and
+    `OnlyOneException` will be thrown. The class will throw `IOError` and
     `OSError` in case there are hardware or OS level corruption.
 
-    >>> from singletony import Singlet
-    ... me = Singlet(filename="test.lock", path="/tmp")
+    >>> from pyamone import OnlyOne
+    ... me = OnlyOne(filename="test.lock", path="/tmp")
 
     This is helpful for both daemons and simple crontab scripts. Works on *NIX
     and Windows OS's.
@@ -123,11 +74,12 @@ class Singlet:
         if not path:
             path = tempfile.gettempdir()
         self.lockfile = os.path.normpath(path + '/' + filename)
-        self.pid = str(os.getpid())
+        self.pid = bytes(os.getpid())
         self.fd = None
-        logger.info("Singlet lockfile: " + self.lockfile)
+        self.closed = 0
+        logger.info("OnlyOne lockfile: " + self.lockfile)
         try:
-            # If advance UNIX system with atomic locks on open
+            # If advanced UNIX system with atomic locks on open
             if BSD:
                 self.fd = os.open(self.lockfile, os.O_CREAT | os.O_EXCL |
                                   os.O_RDWR | os.O_EXLOCK | os.O_NONBLOCK)
@@ -138,12 +90,13 @@ class Singlet:
                     msvcrt.locking(self.fd, msvcrt.LK_NBRLCK, 65)
                 if LIN:
                     fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (IOError, OSError) as e:
+
+        except (PermissionError, FileExistsError, IOError, OSError) as e:
             if e.errno in (errno.EPERM, errno.EWOULDBLOCK):
                 logger.error(
                     "Another instance is already running, quitting.")
                 self.fd = None
-                raise SingletException(
+                raise OnlyOneException(
                     "Another instance is already running, quitting.")
             elif e.errno == errno.EEXIST:
                 # Workaround for Linux/Windows mostly which lacks atomic
@@ -154,25 +107,27 @@ class Singlet:
                         msvcrt.locking(self.fd, msvcrt.LK_NBRLCK, 65)
                     if LIN:
                         fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except (IOError, OSError) as e:
+                except (PermissionError, FileExistsError, IOError, OSError) as e:
                     # Some entity has been faster than us if we WOULDBLOCK
                     if e.errno in (errno.EPERM, errno.EWOULDBLOCK):
                         logger.error(
                             "Another instance is already running, quitting.")
                         self.fd = None
-                        raise SingletException(
+                        raise OnlyOneException(
                             "Another instance is already running, quitting.")
                     else:
                         logger.exception("Something went wrong")
                         self.fd = None
-                        raise
+                        raise OnlyOneException(
+                            "Wrong invocation or other error.") from e
             else:
                 logger.exception("Something went wrong")
                 # Anything else is horribly wrong, we need to raise to the
                 # upper level so the following code in this try clause
                 # won't execute.
                 self.fd = None
-                raise
+                raise OnlyOneException(
+                    "Wrong invocation or other error.") from e
         # By this moment the file should be locked or we should exit so
         # there should realistically be no error here, or it can raise
         if self.oldpid_is_running():
@@ -185,7 +140,7 @@ class Singlet:
             logger.error(
                 "Another instance is already running, quitting.")
             self.fd = None
-            raise SingletException(
+            raise OnlyOneException(
                 "Another instance is already running, quitting.")
         # Barring any OS/Hardware issue this musn't throw anything. But
         # even if it throws we should raise it because it means we
@@ -195,9 +150,57 @@ class Singlet:
             os.ftruncate(self.fd, 0)  # Erase
         os.lseek(self.fd, 0, 0)  # Rewind
         # Write PID with WIN fix
-        os.write(self.fd, self.pid.rjust(64, "#"))
+        os.write(self.fd, self.pid.rjust(64, b"\0"))
         if hasattr(os, "fsync"):
             os.fsync(self.fd)
+
+    def pid_exists(self, pid):
+        """Check whether pid exists in the current process table."""
+        # http://stackoverflow.com/a/23409343/2010538
+        # http://stackoverflow.com/a/28065945/2010538
+        if not WIN:
+            import errno
+            if pid <= 0:
+                return False
+            try:
+                os.kill(pid, 0)
+            except OSError as e:
+                return e.errno == errno.EPERM
+            else:
+                return True
+        else:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            HANDLE = ctypes.c_void_p
+            DWORD = ctypes.c_ulong
+            LPDWORD = ctypes.POINTER(DWORD)
+
+            class ExitCodeProcess(ctypes.Structure):
+                _fields_ = [('hProcess', HANDLE),
+                            ('lpExitCode', LPDWORD)]
+
+            PROCESS_QUERY_INFORMATION = 0x1000
+            process = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid)
+            if not process:
+                return False
+
+            ec = ExitCodeProcess()
+            out = kernel32.GetExitCodeProcess(process, ctypes.byref(ec))
+            if not out:
+                err = kernel32.GetLastError()
+                if err == 5:  # Look after this change, maybe previous line was just a skip
+                    # Access is denied.
+                    logger.warning("Access is denied to get pid info.")
+                kernel32.CloseHandle(process)
+                return False
+            elif bool(ec.lpExitCode):
+                # print ec.lpExitCode.contents
+                # There is an exit code, it quit
+                kernel32.CloseHandle(process)
+                return False
+            # No exit code, it's running.
+            kernel32.CloseHandle(process)
+            return True
 
     def oldpid_is_running(self):
         # Some OS actually recycle pids within same range so we
@@ -205,51 +208,66 @@ class Singlet:
         # won't fire up (*BSD).
         # If not and it is still running we'd rather actually exit
         # right here.
-        oldPid = os.read(self.fd, 64).strip().lstrip("#")
-        return (oldPid and int(oldPid) > 0 and int(oldPid) != int(self.pid) and pid_exists(int(oldPid)))
+        oldPid = os.read(self.fd, 64).strip().lstrip(b"\0")
+        return (oldPid and int(oldPid) > 0 and int(oldPid) != int(self.pid) and self.pid_exists(int(oldPid)))
 
-    def __del__(self):
+    def __enter__(self):
+        # We should be init already so we can just yield ourselves.
+        return self
+
+    def close(self):
         # If we are not initialized don't run the clause
         if self.fd:
             try:
                 os.close(self.fd)
                 os.unlink(self.lockfile)
-            except:
+                self.closed = 1
+            except Exception as e:
                 logger.exception("Unknown issue on exit")
-                raise
+                raise OnlyOneException(
+                    "Unknown issue on exit") from e
+
+    def __exit__(self, type, value, tb):
+        if not self.closed:
+            return self.close()
+
+    def __del__(self):
+        if not self.closed:
+            return self.close()
 
 
-def f(name):
+def launchtest(name):
     from time import sleep
+    logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
     tmp = logger.level
-    logger.setLevel(logging.CRITICAL)  # we do not want to see the warning
+    logger.setLevel(logging.DEBUG)  # we do not want to see the warning
     try:
-        me2 = Singlet(filename=name)  # noqa
+        me2 = OnlyOne(filename=name)
         sleep(1)
-    except SingletException:
+    except OnlyOneException:
         sys.exit(-1)
     logger.setLevel(tmp)
     pass
 
 
-class testSingleton(unittest.TestCase):
+class testOnlyOne(unittest.TestCase):
 
     def test_1(self):
-        me = Singlet(filename="test-1")
+        me = OnlyOne(filename="test-1")
         save = me.lockfile
         del me  # now the lock should be removed
         assert not os.path.isfile(save)
 
     def test_2(self):
-        p = Process(target=f, args=("test-2",))
+        p = Process(target=launchtest, args=("test-2",))
         p.start()
         p.join()
         # the called function should succeed
         assert p.exitcode == 0, "%s != 0" % p.exitcode
 
     def test_3(self):
-        me = Singlet(filename="test-3")  # noqa -- me should still kept
-        p = Process(target=f, args=("test-3",))
+        me = OnlyOne(filename="test-3")  # me should still kept
+        p = Process(target=launchtest, args=("test-3",))
         p.start()
         p.join()
         # the called function should fail because we already have another
@@ -257,14 +275,20 @@ class testSingleton(unittest.TestCase):
         assert p.exitcode != 0, "%s != 0 (2nd execution)" % p.exitcode
         # note, we return -1 but this translates to 255 meanwhile we'll
         # consider that anything different from 0 is good
-        p = Process(target=f, args=("test-3",))
+        p = Process(target=launchtest, args=("test-3",))
         p.start()
         p.join()
         # the called function should fail because we already have another
         # instance running
         assert p.exitcode != 0, "%s != 0 (3rd execution)" % p.exitcode
 
-logger = logging.getLogger("singletony")
+    def test_4(self):
+        with OnlyOne(filename="test-4") as f:
+            assert not f.closed
+        assert f.closed
+
+
+logger = logging.getLogger("pyamone")
 logger.addHandler(logging.StreamHandler())
 
 if __name__ == "__main__":
